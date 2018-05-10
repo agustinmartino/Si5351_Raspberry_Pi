@@ -1,4 +1,5 @@
-
+import time
+import smbus
 from Adafruit_I2C import Adafruit_I2C
 
 SI5351_REGISTER_0_DEVICE_STATUS                       = 0
@@ -81,8 +82,8 @@ SI5351_FREQ_MULT           = 100
 SI5351_CLKOUT_MIN_FREQ     = 4000*SI5351_FREQ_MULT
 SI5351_MULTISYNTH_MAX_FREQ = 150000000*SI5351_FREQ_MULT
 SI5351_MULTISYNTH_MIN_FREQ = 500000*SI5351_FREQ_MULT
-SI5351_MULTISYNTH_A_MIN    = 8#6
-SI5351_MULTISYNTH_A_MAX    = 900#1800
+SI5351_MULTISYNTH_A_MIN    = 6
+SI5351_MULTISYNTH_A_MAX    = 1800
 
 RFRAC_DENOM = 1000000
 
@@ -138,8 +139,8 @@ class Si5351(object):
         # Set the load capacitance for the XTAL
         self.i2c.write8(SI5351_REGISTER_183_CRYSTAL_INTERNAL_LOAD_CAPACITANCE, self.crystalLoad)
 
-	self.clk_freq = [0]*3
-        self.clk_first_set = [False]*3;
+        self.clk_freq = [0]*3
+        self.clk_first_set = [True]*3;
         self.pll_a_freq = 0
         self.pll_b_freq = 0
 
@@ -178,7 +179,7 @@ class Si5351(object):
         P3 = denom
 
         # Get the appropriate starting point for the PLL registers
-        baseaddr = 26 if pll == self.PLL_A else 34
+        baseaddr = 26 if pll == PLL_A else 34
 
         # The datasheet is a nightmare of typos and inconsistencies here!
         self.i2c.write8(baseaddr,   (P3 & 0x0000FF00) >> 8)
@@ -195,7 +196,7 @@ class Si5351(object):
 
         # Store the frequency settings for use with the Multisynth helper
         fvco = int(self.crystalFreq * (mult + float(num) / denom))
-        if pll == self.PLL_A:
+        if pll == PLL_A:
             self.plla_freq = fvco
         else:
             self.pllb_freq = fvco
@@ -276,7 +277,7 @@ class Si5351(object):
         # Set the MSx config registers
         self.i2c.write8(baseaddr,   (P3 & 0x0000FF00) >> 8)
         self.i2c.write8(baseaddr + 1, (P3 & 0x000000FF))
-        self.i2c.write8(baseaddr + 2, (P1 & 0x00030000) >> 16)	# ToDo: Add DIVBY4 (>150MHz) and R0 support (<500kHz) later
+        self.i2c.write8(baseaddr + 2, (P1 & 0x00030000) >> 16)  # ToDo: Add DIVBY4 (>150MHz) and R0 support (<500kHz) later
         self.i2c.write8(baseaddr + 3, (P1 & 0x0000FF00) >> 8)
         self.i2c.write8(baseaddr + 4, (P1 & 0x000000FF))
         self.i2c.write8(baseaddr + 5, ((P3 & 0x000F0000) >> 12) | ((P2 & 0x000F0000) >> 16) )
@@ -285,24 +286,27 @@ class Si5351(object):
 
         # Configure the clk control and enable the output
         clkControlReg = 0x0F                              # 8mA drive strength, MS0 as CLK0 source, Clock not inverted, powered up
-        if pll == self.PLL_B: clkControlReg |= (1 << 5)   # Uses PLLB 
+        if pll == PLL_B: clkControlReg |= (1 << 5)   # Uses PLLB 
         if integer_mode : clkControlReg |= (1 << 6)       # Integer mode
         if output == 0: self.i2c.write8(SI5351_REGISTER_16_CLK0_CONTROL, clkControlReg)
         if output == 1: self.i2c.write8(SI5351_REGISTER_17_CLK1_CONTROL, clkControlReg)
         if output == 2: self.i2c.write8(SI5351_REGISTER_18_CLK2_CONTROL, clkControlReg)
 
 
-    def enableOutputs(self, enabled):
+    def enableOutput(self, output, enable=1):
 
-        # Enabled desired outputs (see Register 3)
-        val = 0x00 if enabled else 0xFF
-        self.i2c.write8(SI5351_REGISTER_3_OUTPUT_ENABLE_CONTROL, val)
+        reg_val = self.i2c.readU8(SI5351_REGISTER_3_OUTPUT_ENABLE_CONTROL)
+        if(enable==1):
+            reg_val &= ~(1 << (output & 0xFF))
+        else:
+            reg_val |=  (1 << (output & 0xFF))
+        self.i2c.write8(SI5351_REGISTER_3_OUTPUT_ENABLE_CONTROL, reg_val)
 
 
     def selectRDiv(self, freq):     
 
         #Select final divider value when desired frequency is low  
-	r_div = 1
+        r_div = 1
         if((freq >= SI5351_CLKOUT_MIN_FREQ) and (freq < SI5351_CLKOUT_MIN_FREQ * 2)):
             r_div = R_DIV_128
             freq  = freq*128
@@ -330,37 +334,31 @@ class Si5351(object):
     def multisynthCalc(self, freq, pll_freq): 
 
         #Get multisynth config parameters 
-	#Multisynth bounds checking
-	if freq > SI5351_MULTISYNTH_MAX_FREQ:
+        #Multisynth bounds checking
+        if freq > SI5351_MULTISYNTH_MAX_FREQ:
             new_freq = SI5351_MULTISYNTH_MAX_FREQ
-	if freq < SI5351_MULTISYNTH_MIN_FREQ:
+        elif freq < SI5351_MULTISYNTH_MIN_FREQ:
             new_freq = SI5351_MULTISYNTH_MIN_FREQ
         else:
             new_freq = freq
         #TODO: Add mode for frequencies higher than 150MHz
 
         #Determine integer part of feedback equation
-        a = pll_freq / new_freq;
+        a = int(pll_freq / new_freq);
 
         if (a < SI5351_MULTISYNTH_A_MIN):
-            new_freq = pll_freq / SI5351_MULTISYNTH_A_MIN;
+            a = SI5351_MULTISYNTH_A_MIN;
         if (a > SI5351_MULTISYNTH_A_MAX):
-            new_freq = pll_freq / SI5351_MULTISYNTH_A_MAX;
+            a = SI5351_MULTISYNTH_A_MAX;
 
-        b = (pll_freq % new_freq * RFRAC_DENOM) / new_freq;
+        b = int(((pll_freq % new_freq) * RFRAC_DENOM) / new_freq);
+
         c = RFRAC_DENOM if (b != 0) else 1
 
         integer_mode = (b==0) and (a in MS_INTEGER_MODE_DIVS)
         return a, b, c, integer_mode
 
 
-    #TODO: Setear primero frecuencia de PLLs a 800MHz por ejemplo dsp
-    #       solo se modifican multisynths.
-    #      La frecuencia que se pasa es un entero con resolucion 0.01Hz
-    #      Por ahora no se soportan frecuencias por encima de 150MHz
-    #      
-    #
-    #
     def setFreq(self, freq, clock_output):
 
         # Lower bounds check
@@ -369,16 +367,14 @@ class Si5351(object):
         # Upper bounds check
         if(freq > SI5351_MULTISYNTH_MAX_FREQ):
             freq = SI5351_MULTISYNTH_MAX_FREQ;
-	
-        #TODO: Only initialize clock one time
+        
         self.clk_freq[clock_output] = freq
         if(self.clk_first_set[clock_output]):
-            #output_enable()
-            self.clk_first_set[clock_output] = True      
+            self.enableOutput(clock_output, 1)
+            self.clk_first_set[clock_output] = False
 
         #Choose R divider, adjust freq
         rdiv, freq = self.selectRDiv(freq)
-        self.setupRdiv(clock_output, rdiv)
 
         #TODO: Add support to select which PLL to use
         #Check for PLL if not set configure PLL_A
@@ -388,20 +384,14 @@ class Si5351(object):
 
         #Config multisynth
         a,b,c,integer_mode = self.multisynthCalc(freq, self.plla_freq)
-        self.setupMultisynth(clock_output, PLL_A, a, b, c, integer_mode)        
+        self.setupMultisynth(clock_output, PLL_A, a, b, c, integer_mode)
+        self.setupRdiv(clock_output, rdiv)
 
 
-if __name__ == '__main__':
-    si = Si5351()
 
-    print "Set Output #0 to 13.703704 MHz"  
 
-    # vco = 25 MHz * (24 + 2 / 3) = 616.67 MHz
-    si.setupPLL(si.PLL_A, 24, 2, 3)
-    # out = 616.67 MHz / 45 = 13.703704 MHz 
-    si.setupMultisynth(0, si.PLL_A, 45)
-    # si.setupRdiv(0, si.R_DIV_64)
-    si.enableOutputs(True)
+
+
 
 
 
