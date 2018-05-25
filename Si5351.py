@@ -78,14 +78,19 @@ SI5351_REGISTER_170_CLK5_INITIAL_PHASE_OFFSET         = 170
 SI5351_REGISTER_177_PLL_RESET                         = 177
 SI5351_REGISTER_183_CRYSTAL_INTERNAL_LOAD_CAPACITANCE = 183
 
-SI5351_FREQ_MULT           = 100
-SI5351_CLKOUT_MIN_FREQ     = 4000*SI5351_FREQ_MULT
-SI5351_MULTISYNTH_MAX_FREQ = 150000000*SI5351_FREQ_MULT
-SI5351_MULTISYNTH_MIN_FREQ = 500000*SI5351_FREQ_MULT
-SI5351_MULTISYNTH_A_MIN    = 6
-SI5351_MULTISYNTH_A_MAX    = 1800
+SI5351_FREQ_MULT            = 100
+SI5351_CLKOUT_MIN_FREQ      = 4000*SI5351_FREQ_MULT
+SI5351_MULTISYNTH_MAX_FREQ  = 150000000*SI5351_FREQ_MULT
+SI5351_MULTISYNTH_MIN_FREQ  = 500000*SI5351_FREQ_MULT
+SI5351_MULTISYNTH_SHARE_MAX = 100000000*SI5351_FREQ_MULT
+SI5351_MULTISYNTH_A_MIN     = 6
+SI5351_MULTISYNTH_A_MAX     = 1800
+MULTISYNTH_DIV4_FREQ        = 150000000*SI5351_FREQ_MULT
+PLL_DEFAULT_FREQ            = 800000000*SI5351_FREQ_MULT
+PLL_MAX_FREQ                = 900000000*SI5351_FREQ_MULT
 
 RFRAC_DENOM = 1000000
+DEFAULT_PLL = 800000000*SI5351_FREQ_MULT
 
 SI5351_I2C_ADDRESS_DEFAULT = 0x60
 
@@ -93,11 +98,13 @@ SI5351_CRYSTAL_LOAD_6PF  = (1<<6)
 SI5351_CRYSTAL_LOAD_8PF  = (2<<6)
 SI5351_CRYSTAL_LOAD_10PF = (3<<6)
 
-SI5351_CRYSTAL_FREQ_25MHZ = 25000000
-SI5351_CRYSTAL_FREQ_27MHZ = 27000000
+SI5351_CRYSTAL_FREQ_25MHZ = 25000000*SI5351_FREQ_MULT
+SI5351_CRYSTAL_FREQ_27MHZ = 27000000*SI5351_FREQ_MULT
 
 PLL_A = 0
 PLL_B = 1
+
+N_OUTPUTS = 3
 
 R_DIV_1   = 0
 R_DIV_2   = 1
@@ -116,9 +123,10 @@ class Si5351(object):
 
         self.crystalFreq     = SI5351_CRYSTAL_FREQ_25MHZ
         self.crystalLoad     = SI5351_CRYSTAL_LOAD_10PF
-        self.crystalPPM      = 30
-        self.plla_freq       = 0
-        self.pllb_freq       = 0
+        self.pll_freq        = {PLL_A : 0, PLL_B : 0}
+        self.clk_freq        = [0]*N_OUTPUTS
+        self.clk_first_set   = [True]*N_OUTPUTS
+        self.pll_assign      = [PLL_A, PLL_A, PLL_B]
 
         self.i2c = Adafruit_I2C(address=address, busnum=busnum)
         self.address = address
@@ -139,10 +147,6 @@ class Si5351(object):
         # Set the load capacitance for the XTAL
         self.i2c.write8(SI5351_REGISTER_183_CRYSTAL_INTERNAL_LOAD_CAPACITANCE, self.crystalLoad)
 
-        self.clk_freq = [0]*3
-        self.clk_first_set = [True]*3;
-        self.pll_a_freq = 0
-        self.pll_b_freq = 0
 
 
     def setupPLL(self, pll, mult, num=0, denom=1):
@@ -194,12 +198,11 @@ class Si5351(object):
         # Reset both PLLs
         self.i2c.write8(SI5351_REGISTER_177_PLL_RESET, (1<<7) | (1<<5))
 
-        # Store the frequency settings for use with the Multisynth helper
         fvco = int(self.crystalFreq * (mult + float(num) / denom))
         if pll == PLL_A:
-            self.plla_freq = fvco
+            self.pll_freq[PLL_A] = fvco
         else:
-            self.pllb_freq = fvco
+            self.pll_freq[PLL_B] = fvco
 
 
     def setupRdiv(self, output, div):
@@ -306,7 +309,7 @@ class Si5351(object):
     def selectRDiv(self, freq):     
 
         #Select final divider value when desired frequency is low  
-        r_div = 1
+        r_div = 0
         if((freq >= SI5351_CLKOUT_MIN_FREQ) and (freq < SI5351_CLKOUT_MIN_FREQ * 2)):
             r_div = R_DIV_128
             freq  = freq*128
@@ -359,7 +362,39 @@ class Si5351(object):
         return a, b, c, integer_mode
 
 
+    def getPLLparams(self, pll_freq):
+        
+        # Return fractional divider for given PLL freq 
+        a    = int(pll_freq / float(self.crystalFreq))
+        rest = (pll_freq % self.crystalFreq)/float(self.crystalFreq)
+        b    = int(rest * RFRAC_DENOM)
+        c    = RFRAC_DENOM
+        return a, b, c
+
+
+    def PLLcalc(self, freq):
+        
+        # Determine optimum pll_freq for output frequency
+        #   and return configuration parameters
+
+        # For frequencies < 100MHz use default pll freq
+        if freq < 100000000*SI5351_FREQ_MULT:
+            pll_freq = PLL_DEFAULT_FREQ
+        # Higher frequencies use max PLL 
+        elif freq < MULTISYNTH_DIV4_FREQ:
+            pll_freq = PLL_MAX_FREQ
+        # For frequencies > 150MHz use multisynth in div 4 mode
+        else:
+            pll_freq = freq*4
+
+        a,b,c = self.getPLLparams(pll_freq)
+        return pll_freq, a, b, c
+
+
     def setFreq(self, freq, clock_output):
+
+        # Assigned PLL for clock_output
+        assigned_pll = self.pll_assign[clock_output]
 
         # Lower bounds check
         if(freq > 0 and freq < SI5351_CLKOUT_MIN_FREQ):
@@ -367,24 +402,55 @@ class Si5351(object):
         # Upper bounds check
         if(freq > SI5351_MULTISYNTH_MAX_FREQ):
             freq = SI5351_MULTISYNTH_MAX_FREQ;
-        
+        # Check for more than one clock output > 100MHz on same PLL
+        if(freq > SI5351_MULTISYNTH_SHARE_MAX):
+            for kk in range(N_OUTPUTS):
+                if self.clk_freq[kk] > SI5351_MULTISYNTH_SHARE_MAX:
+                    if self.pll_assign[kk] == assigned_pll and kk != clock_output:
+                        raise ValueError('Two outputs higher than 100MHz cannot share the same PLL')
+
+        # Save freq, enable output
         self.clk_freq[clock_output] = freq
         if(self.clk_first_set[clock_output]):
             self.enableOutput(clock_output, 1)
             self.clk_first_set[clock_output] = False
 
-        #Choose R divider, adjust freq
+        # Choose R divider, adjust freq
         rdiv, freq = self.selectRDiv(freq)
+        
+        # Check if default PLL freq is enough if not move PLL and recalculate
+        # this condition should include frequencies higher than 150MHz
+        # in that case the multisynth divider is fixed (4) and the PLL
+        # is adjusted for the output_freq. All others multisynths on the same
+        # PLL must be updated.
+        div4_mode = freq > MULTISYNTH_DIV4_FREQ
+        new_pll, a, b, c = self.PLLcalc(freq)
+        
+        # When PLL is first set or new_pll is higher 
+        if new_pll > self.pll_freq[assigned_pll]:
+            self.setupPLL(assigned_pll, a, b, c)
 
-        #TODO: Add support to select which PLL to use
-        #Check for PLL if not set configure PLL_A
-        if self.plla_freq == 0:
-            self.setupPLL(PLL_A, 32)
-            self.plla_freq = 80000000000
+            # Recalculate multisynths previously tied to PLL
+            for kk in range(N_OUTPUTS):
+                if (not self.clk_first_set[kk] and self.pll_assign[kk] == assigned_pll 
+                    and kk != clock_output):
 
-        #Config multisynth
-        a,b,c,integer_mode = self.multisynthCalc(freq, self.plla_freq)
-        self.setupMultisynth(clock_output, PLL_A, a, b, c, integer_mode)
+                    # Choose R divider, adjust freq
+                    rdiv, freq_divided = self.selectRDiv(self.clk_freq[kk])
+                    
+                    # Config multisynth
+                    a,b,c,integer_mode = self.multisynthCalc(freq_divided, new_pll)
+                    self.setupMultisynth(kk, assigned_pll, a, b, c, integer_mode)
+                    self.setupRdiv(kk, rdiv)
+                    
+
+        if div4_mode:
+            #Multisinth in div4 mode
+            print 'Nothing yet'
+        else:
+            # Config multisynth
+            a,b,c,integer_mode = self.multisynthCalc(freq, self.pll_freq[assigned_pll])
+            self.setupMultisynth(clock_output, assigned_pll, a, b, c, integer_mode)
         self.setupRdiv(clock_output, rdiv)
 
 
@@ -395,5 +461,13 @@ class Si5351(object):
 
 
 
+#TODO: Ver integer mode cuando se configura el PLL
+#TODO: Agregar calculo del PLL cuando se piden frecuencias mayores a 100MHZ
+#TODO: Agregar modo div4 cuando se requiere frecuencias mayores a 150MHz
+#TODO: Verificar seteo rapido de frecuencias cuando se usa para WSPR
+#TODO: Agregar funcion de status para ver config actual
 
-
+#TODO : Agregar drive_strength
+#TODO : Agregar set phase
+#TODO : Agregar invert
+#TODO : Agregar update status
